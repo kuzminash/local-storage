@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 
+#include <chrono>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -18,6 +19,9 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <vector>
+#include <fstream>
+#include <thread>
 
 static_assert(EAGAIN == EWOULDBLOCK);
 
@@ -148,6 +152,114 @@ SocketStatePtr accept_connection(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+class MyCoolHashTable {
+public:
+    std::unordered_map<std::string, uint64_t> table;
+    std::vector<std::pair<std::string, uint64_t>> logs;
+    std::thread threadForTable;
+    std::mutex tableThreadMutex;
+    std::string pathLogFile = "log_file.txt";
+    std::string pathTableFile = "table_file.txt";
+    bool killed = false;
+
+    void threadFunc() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            if (killed) break;
+            std::lock_guard<std::mutex> lock(tableThreadMutex);
+            writeTable();
+        }
+    }
+
+    /*
+     * Восстанавливаем данные, если все упало
+     * Сначала читаем таблицу, а после логи
+     */
+    void restoreAllData() {
+        std::string line, key;
+        uint64_t value;
+        std::ifstream tableStreamIn(pathTableFile);
+        if (tableStreamIn.is_open()) {
+            while (getline(tableStreamIn, line)) {
+                std::stringstream in(line);
+                in >> key >> value;
+                table[key] = value;
+            }
+        }
+        tableStreamIn.close();
+
+        std::ifstream logStreamIn(pathLogFile);
+        if (logStreamIn.is_open()) {
+            while (getline(logStreamIn, line)) {
+                std::stringstream in(line);
+                in >> key >> value;
+                table[key] = value;
+            }
+        }
+        logStreamIn.close();
+    }
+
+    MyCoolHashTable() {
+        restoreAllData();
+        //В отдельном потоке будем каждые сколько-то секунд записывать в файл таблицу
+        threadForTable = std::thread([this] { threadFunc(); });
+    }
+
+    /*
+     * При вызове деструктора - записываем логи в файл
+     */
+    ~MyCoolHashTable() {
+
+        killed = true;
+        threadForTable.join();
+
+
+        std::ofstream logStream;
+        logStream.open(pathLogFile, std::ofstream::out | std::ofstream::trunc);
+
+        for (auto& it: logs) {
+            logStream << it.first << ' ' << it.second << '\n';
+        }
+
+        logStream.close();
+    }
+
+    std::pair<bool, uint64_t> find(const std::string &key) {
+        std::lock_guard<std::mutex> lock(tableThreadMutex);
+        if (table.find(key) != table.end()) return std::make_pair(true, table[key]);
+        return std::make_pair(false, 0);
+    }
+
+    void insert(const std::string &key, const uint64_t &value) {
+        std::lock_guard<std::mutex> lock(tableThreadMutex);
+        logs.emplace_back(std::make_pair(key, value));
+        table[key] = value;
+    }
+
+    /*
+     * Каждые сколько-то секунд будем записывать таблицу в файл.
+     * В таком случае очищаем логи так как они нам больше не нужны
+     */
+    void writeTable() {
+        std::ofstream logStream;
+        std::ofstream tableStream;
+        logStream.open(pathLogFile, std::ofstream::out | std::ofstream::trunc);
+        tableStream.open(pathTableFile, std::ofstream::out | std::ofstream::trunc);
+
+        for (auto& it: table) {
+            tableStream << it.first << ' ' << it.second << '\n';
+        }
+        logs.clear();
+
+        logStream.close();
+        tableStream.close();
+    }
+};
+
+
+////////////////////////////////////////////////////////////////////////////////
+
+
 int main(int argc, const char** argv)
 {
     if (argc < 2) {
@@ -192,7 +304,7 @@ int main(int argc, const char** argv)
      */
 
     // TODO on-disk storage
-    std::unordered_map<std::string, uint64_t> storage;
+    MyCoolHashTable table;
 
     auto handle_get = [&] (const std::string& request) {
         NProto::TGetRequest get_request;
@@ -206,9 +318,10 @@ int main(int argc, const char** argv)
 
         NProto::TGetResponse get_response;
         get_response.set_request_id(get_request.request_id());
-        auto it = storage.find(get_request.key());
-        if (it != storage.end()) {
-            get_response.set_offset(it->second);
+
+        std::pair<bool, uint64_t> it = table.find(get_request.key());
+        if (it.first) {
+            get_response.set_offset(it.second);
         }
 
         std::stringstream response;
@@ -227,8 +340,7 @@ int main(int argc, const char** argv)
         }
 
         LOG_DEBUG_S("put_request: " << put_request.ShortDebugString());
-
-        storage[put_request.key()] = put_request.offset();
+        table.insert(put_request.key(), put_request.offset());
 
         NProto::TPutResponse put_response;
         put_response.set_request_id(put_request.request_id());
