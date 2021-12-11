@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include "rpc.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -152,22 +153,73 @@ SocketStatePtr accept_connection(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct Value
+{
+    uint64_t X = 0;
+    uint64_t V = 0;
+};
+
+struct Table
+{
+    std::string tab_file;
+    std::string log_file;
+    std::unordered_map<std::string, Value> data;
+
+    std::ofstream log;
+
+    void init(std::string path_prefix)
+    {
+        tab_file = path_prefix + ".tab";
+        log_file = path_prefix + ".log";
+    }
+
+    void reopen_log()
+    {
+        log.open(log_file, std::ofstream::out | std::ofstream::trunc);
+    }
+};
+
 class MyCoolHashTable {
 public:
-    std::unordered_map<std::string, uint64_t> table;
-    std::vector<std::pair<std::string, uint64_t>> logs;
-    std::thread threadForTable;
-    std::mutex tableThreadMutex;
-    std::string pathLogFile = "log_file.txt";
-    std::string pathTableFile = "table_file.txt";
-    bool killed = false;
+    static constexpr uint32_t tab_count = 2;
+    std::array<Table, tab_count> tables;
+    mutable std::mutex mutex;
+    uint32_t active_tab_idx = 0;
+    uint64_t key_version = 0;
+
+    std::thread syncer;
+    bool running = true;
+
+    Table& active()
+    {
+        return tables[active_tab_idx % tab_count];
+    }
+
+    Table& inactive()
+    {
+        return tables[(active_tab_idx - 1) % tab_count];
+    }
+
+    const Table& active() const
+    {
+        return tables[active_tab_idx % tab_count];
+    }
+
+    const Table& inactive() const
+    {
+        return tables[(active_tab_idx - 1) % tab_count];
+    }
 
     void threadFunc() {
-        while (true) {
+        while (running) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-            if (killed) break;
-            std::lock_guard<std::mutex> lock(tableThreadMutex);
-            writeTable();
+
+            {
+                std::lock_guard<std::mutex> g(mutex);
+                ++active_tab_idx;
+            }
+
+            writeTable(inactive());
         }
     }
 
@@ -175,84 +227,96 @@ public:
      * Восстанавливаем данные, если все упало
      * Сначала читаем таблицу, а после логи
      */
-    void restoreAllData() {
+    void restore(Table& tab) {
         std::string line, key;
         uint64_t value;
-        std::ifstream tableStreamIn(pathTableFile);
+        uint64_t version;
+        std::ifstream tableStreamIn(tab.tab_file);
         if (tableStreamIn.is_open()) {
             while (getline(tableStreamIn, line)) {
                 std::stringstream in(line);
-                in >> key >> value;
-                table[key] = value;
+                in >> key >> value >> version;
+                tab.data[key] = {value, version};
+                key_version = std::max(version, key_version);
             }
         }
         tableStreamIn.close();
 
-        std::ifstream logStreamIn(pathLogFile);
+        std::ifstream logStreamIn(tab.log_file);
         if (logStreamIn.is_open()) {
             while (getline(logStreamIn, line)) {
                 std::stringstream in(line);
-                in >> key >> value;
-                table[key] = value;
+                in >> key >> value >> version;
+                tab.data[key] = {value, version};
+                key_version = std::max(version, key_version);
             }
         }
         logStreamIn.close();
     }
 
-    MyCoolHashTable() {
-        restoreAllData();
-        //В отдельном потоке будем каждые сколько-то секунд записывать в файл таблицу
-        threadForTable = std::thread([this] { threadFunc(); });
+    MyCoolHashTable()
+    {
+        tables[0].init("tab0");
+        tables[1].init("tab1");
+
+        for (auto& tab: tables) {
+            restore(tab);
+        }
+
+        active().reopen_log();
+
+        syncer = std::thread([this] {
+            threadFunc();
+        });
     }
 
     /*
      * При вызове деструктора - записываем логи в файл
      */
     ~MyCoolHashTable() {
-
-        killed = true;
-        threadForTable.join();
-
-
-        std::ofstream logStream;
-        logStream.open(pathLogFile, std::ofstream::out | std::ofstream::trunc);
-
-        for (auto& it: logs) {
-            logStream << it.first << ' ' << it.second << '\n';
-        }
-
-        logStream.close();
+        running = false;
+        syncer.join();
     }
 
-    std::pair<bool, uint64_t> find(const std::string &key) {
-        std::lock_guard<std::mutex> lock(tableThreadMutex);
-        if (table.find(key) != table.end()) return std::make_pair(true, table[key]);
-        return std::make_pair(false, 0);
+    std::pair<bool, uint64_t> find(const std::string &key) const {
+        std::lock_guard<std::mutex> g(mutex);
+        Value value;
+        for (const auto& table: tables) {
+            const auto it = table.data.find(key);
+            if (it != table.data.end() && it->second.V > value.V) {
+                value = it->second;
+            }
+        }
+
+        return std::make_pair(value.V != 0, value.X);
     }
 
     void insert(const std::string &key, const uint64_t &value) {
-        std::lock_guard<std::mutex> lock(tableThreadMutex);
-        logs.emplace_back(std::make_pair(key, value));
-        table[key] = value;
+        std::lock_guard<std::mutex> g(mutex);
+        ++key_version;
+        auto& tab = active();
+        tab.log << key << ' ' << value << ' ' << key_version << '\n';
+        // TODO fsync somewhere here or after processing a batch of writes
+        tab.data[key] = {value, key_version};
     }
 
     /*
      * Каждые сколько-то секунд будем записывать таблицу в файл.
      * В таком случае очищаем логи так как они нам больше не нужны
      */
-    void writeTable() {
-        std::ofstream logStream;
+    void writeTable(Table& tab) {
         std::ofstream tableStream;
-        logStream.open(pathLogFile, std::ofstream::out | std::ofstream::trunc);
-        tableStream.open(pathTableFile, std::ofstream::out | std::ofstream::trunc);
+        tableStream.open(tab.tab_file, std::ofstream::out | std::ofstream::trunc);
 
-        for (auto& it: table) {
-            tableStream << it.first << ' ' << it.second << '\n';
+        for (auto& it: tab.data) {
+            tableStream << it.first
+                << ' ' << it.second.X
+                << ' ' << it.second.V
+                << '\n';
         }
-        logs.clear();
 
-        logStream.close();
         tableStream.close();
+        tab.reopen_log();
     }
 };
 
